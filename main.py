@@ -1,69 +1,91 @@
-import os
+"""CLI entry point: recursively convert .pub files under a folder to PDF."""
+
 import argparse
-import win32com.client
+import os
+import sys
+
 from tqdm import tqdm
-# import pythoncom
 
-# 1. Setup Arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("folder", help="Path to folder containing pub files")
-args = parser.parse_args()
+from publisher import PublisherSession
 
-# 2. Get list of files (RECURSIVELY)
-folder_path = os.path.abspath(args.folder)
-pub_files = []
+RESTART_EVERY = 50  # Relaunch Publisher every N files to curb memory leaks
 
-# os.walk automatically goes through every subfolder
-for root, dirs, files in os.walk(folder_path):
-    for file in files:
-        if file.endswith(".pub"):
-            # We store the full path immediately
-            pub_files.append(os.path.join(root, file))
 
-if not pub_files:
-    print("No .pub files found.")
-    exit()
+def find_pub_files(folder_path):
+    """Return absolute paths to every .pub file under folder_path (recursive)."""
+    pub_files = []
+    for root, _dirs, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith(".pub"):
+                pub_files.append(os.path.abspath(os.path.join(root, file)))
+    return pub_files
 
-print(f"Found {len(pub_files)} files. Starting SEQUENTIAL conversion...")
 
-# 3. Open Publisher ONCE (Outside the loop)
-try:
-    # pythoncom.CoInitialize()
-    publisher = win32com.client.Dispatch("Publisher.Application")
-    # CRITICAL: This stops popups like "Update Links?" from blocking the script
-    # publisher.DisplayAlerts = 0 
-except Exception as e:
-    print(e)
-    print("Failed to open Publisher")
-    exit()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Recursively convert .pub files to PDF.")
+    parser.add_argument("folder", help="Path to folder containing .pub files")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing PDFs (default: skip files whose PDF already exists)",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help='Suffix to append to output PDF filenames (e.g. "_www")',
+    )
+    return parser.parse_args()
 
-# 4. Loop through files one by one
-errors = []
 
-for file_name in tqdm(pub_files):
-    input_path = os.path.join(folder_path, file_name)
-    output_path = os.path.splitext(input_path)[0] + ".pdf"
-    
-    try:
-        # Open the document
-        doc = publisher.Open(input_path)
-        
-        # Export (2 = pbFixedFormatTypePDF)
-        doc.ExportAsFixedFormat(2, output_path)
-        
-        # Close the document strictly
-        doc.Close()
-        
-    except Exception as e:
-        errors.append(f"{file_name}: {e}")
+def main():
+    args = parse_args()
 
-# 5. Clean up
-publisher.Quit()
+    folder_path = os.path.abspath(args.folder)
+    if not os.path.isdir(folder_path):
+        print(f"Not a directory: {folder_path}")
+        sys.exit(1)
 
-print("\n--- Processing Complete ---")
-if errors:
-    print(f"Completed with {len(errors)} errors:")
-    for err in errors:
-        print(err)
-else:
-    print("All files converted successfully.")
+    pub_files = find_pub_files(folder_path)
+    if not pub_files:
+        print("No .pub files found.")
+        sys.exit(0)
+
+    print(f"Found {len(pub_files)} files. Starting sequential conversion...")
+
+    errors = []
+    skipped = []
+    converted = 0
+
+    with PublisherSession() as session:
+        for i, input_path in enumerate(tqdm(pub_files), start=1):
+            try:
+                result = session.convert(
+                    input_path,
+                    suffix=args.suffix,
+                    overwrite=args.overwrite,
+                )
+                if result is None:
+                    skipped.append(input_path)
+                else:
+                    converted += 1
+            except Exception as e:
+                errors.append(f"{input_path}: {e}")
+
+            # Periodically restart Publisher to release accumulated memory
+            if i % RESTART_EVERY == 0 and i < len(pub_files):
+                session.restart()
+
+    print("\n--- Processing Complete ---")
+    print(f"Converted: {converted}")
+    if skipped:
+        print(f"Skipped (PDF already existed): {len(skipped)}")
+    if errors:
+        print(f"Errors: {len(errors)}")
+        for err in errors:
+            print(f"  {err}")
+    else:
+        print("No errors.")
+
+
+if __name__ == "__main__":
+    main()
